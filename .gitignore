@@ -1,0 +1,9 @@
+__pycache__/
+*_env/
+coding_test/
+bf_snapshot/
+asif_paper_demo/
+smoke_test_output/
+neat_dataset/
+results/
+*.sh
