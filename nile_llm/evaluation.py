@@ -9,7 +9,7 @@ evaluation.py —— 对 NILE 生成结果做 L1–L4 离线评估
   L4  LLM-judge           按槽位/维度给出结论 + 总体语义等价判定，支持多模型/多次投票
 
 用法:
-  python evaluation.py metrics --preds preds_*.jsonl
+  python evaluation.py metrics --preds preds_*.jsonl [--intersect]
   python evaluation.py judge   --eval eval_base_llama3.1-8b.jsonl --judge_models qwen2.5:32b
 
 依赖: numpy, requests
@@ -283,7 +283,7 @@ def summarize(rows, tag):
     S["L2_canon_em_ci95"] = boot_ci(col(lambda r: r["l2"]["canon_em"]))
     S["L3_equiv_ci95"] = boot_ci(col(lambda r: r["l3"]["equiv"]))
 
-    for k in ("sec", "prompt_tokens", "gen_tokens"):
+    for k in ("sec", "prompt_tokens", "prompt_chars", "gen_tokens"):
         v = [r[k] for r in rows if r.get(k) is not None]
         if v:
             S[f"mean_{k}"] = float(np.mean(v))
@@ -310,10 +310,19 @@ def summarize(rows, tag):
 
 def cmd_metrics(a):
     files = sorted({f for pat in a.preds for f in glob.glob(pat)})
+    raws = {fp_: [json.loads(l) for l in open(fp_, encoding="utf-8") if l.strip()] for fp_ in files}
+    common = None
+    if a.intersect and raws:      # 不同方法有 [FAIL] 时 n 会不同；取各文件共有的 id，保证对比在同一批样本上
+        common = set.intersection(*[{r["id"] for r in v} for v in raws.values()])
+        print(f"--intersect：{len(raws)} 个文件的共有样本 {len(common)} 条（各文件原有 "
+              f"{', '.join(str(len(v)) for v in raws.values())} 条）")
     table = []
     for fp_ in files:
         tag = re.sub(r"^preds_", "", os.path.splitext(os.path.basename(fp_))[0])
-        raw = [json.loads(l) for l in open(fp_, encoding="utf-8") if l.strip()]
+        raw = raws[fp_]
+        n_raw = len(raw)
+        if common is not None:
+            raw = [r for r in raw if r["id"] in common]
         rows, n_bad = [], 0
         for r in raw:
             gp, _ = parse_nile(r["gold"])
@@ -327,7 +336,7 @@ def cmd_metrics(a):
                 "gold_invalid": gold_invalid,
                 "gold_action": gp["action"] if gp else "?",
             }
-            for k in ("sec", "prompt_tokens", "gen_tokens"):
+            for k in ("sec", "prompt_tokens", "prompt_chars", "gen_tokens"):
                 if r.get(k) is not None:
                     row[k] = r[k]
             if not gold_invalid:
@@ -348,6 +357,10 @@ def cmd_metrics(a):
                 for k in ("model", "mode", "shots", "split", "seed", "hardware", "num_ctx", "workers")
             }
             S["run"].update({f"model_{k}": v for k, v in (meta.get("model_info") or {}).items()})
+            S["n_requested"] = meta.get("n_requested")
+        S["n_pred_rows"] = n_raw
+        nreq = S.get("n_requested")
+        S["coverage"] = (n_raw / nreq) if nreq else None
 
         with open(f"eval_{tag}.jsonl", "w", encoding="utf-8") as f:
             for r in rows:
@@ -356,6 +369,9 @@ def cmd_metrics(a):
             json.dump(S, f, ensure_ascii=False, indent=2)
 
         print(f"\n=== {tag}  (n={S['n']}, gold 不可解析被排除 {n_bad}) ===")
+        if S.get("n_requested") and n_raw < S["n_requested"]:
+            print(f"  [警告] 只有 {n_raw}/{S['n_requested']} 条预测（有 [FAIL] 未补跑）；"
+                  f"与其他方法比较前请补跑，或使用 --intersect")
         for k in (
             "L1_bleu",
             "L1_rouge_l",
@@ -392,6 +408,9 @@ def cmd_metrics(a):
             "hardware",
             "model_quantization_level",
             "n",
+            "n_requested",
+            "coverage",
+            "L1_syntax_valid",
             "L1_bleu",
             "L1_rouge_l",
             "L1_cosine_sim",
@@ -401,6 +420,7 @@ def cmd_metrics(a):
             "L3_rule_F1",
             "mean_sec",
             "mean_prompt_tokens",
+            "mean_prompt_chars",
             "mean_gen_tokens",
         ]
         with open("metrics_table.csv", "w", newline="", encoding="utf-8") as f:
@@ -589,6 +609,8 @@ def main():
 
     m = sp.add_parser("metrics")
     m.add_argument("--preds", nargs="+", required=True)
+    m.add_argument("--intersect", action="store_true",
+                   help="只在各预测文件共有的 id 上计算，保证不同方法的 n 一致（有 FAIL 样本时用）")
 
     j = sp.add_parser("judge")
     j.add_argument("--eval", nargs="+", required=True)
