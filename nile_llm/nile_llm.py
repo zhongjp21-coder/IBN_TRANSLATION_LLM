@@ -14,17 +14,17 @@ NL -> NILE 意图翻译 demo（复现 Tu et al., IJNM 2025 的实验流程，基
   ollama pull llama3.1:8b ; ollama pull nomic-embed-text      (并保持 `ollama serve` 运行)
   微调另需：pip install unsloth trl datasets
 
-用法（本脚本只负责"产出预测"，所有指标一律在 nile_eval.py 里算）：
-  python nile_llm_demo.py check                                      # 数据检查 / 天花板估计
-  python nile_llm_demo.py predict --mode base   --limit 50           # B (zero-shot)
-  python nile_llm_demo.py predict --mode few_shot    --limit 50 --shots 9 # B+I # B+Few-shot（固定抽样，论文里没用到）
-  python nile_llm_demo.py predict --mode icl    --limit 50 --shots 9 # B+I
-  python nile_llm_demo.py predict --mode icl_cl --limit 50 --shots 9 # B+I+C（串行，结果依赖样本顺序）
-  python nile_llm_demo.py predict --mode icl --workers 4 --hardware V100S-32GB   # 并发(需 OLLAMA_NUM_PARALLEL>=4)
-  python nile_llm_demo.py finetune --out nile_ft                     # LoRA 微调 + 导出 GGUF
-  python nile_llm_demo.py predict --model llama31-nile-ft --mode base   # 微调模型(ollama create 之后)
+用法（本脚本只负责"产出预测"，所有指标一律在 evaluation.py 里算）：
+  python nile_llm.py check                                      # 数据检查 / 天花板估计
+  python nile_llm.py predict --mode base   --limit 50           # B (zero-shot)
+  python nile_llm.py predict --mode few_shot    --limit 50 --shots 9 # B+I # B+Few-shot（固定抽样，论文里没用到）
+  python nile_llm.py predict --mode icl    --limit 50 --shots 9 # B+I
+  python nile_llm.py predict --mode icl_cl --limit 50 --shots 9 # B+I+C（串行，结果依赖样本顺序）
+  python nile_llm.py predict --mode icl --workers 4 --hardware V100S-32GB   # 并发(需 OLLAMA_NUM_PARALLEL>=4)
+  python nile_llm.py finetune --out nile_ft                     # LoRA 微调 + 导出 GGUF
+  python nile_llm.py predict --model llama31-nile-ft --mode base   # 微调模型(ollama create 之后)
 产出：preds_<tag>.jsonl（逐条预测，支持断点续跑）、run_<tag>.json（模型/量化/硬件/耗时元数据）
-评估：python nile_eval.py metrics --preds preds_*.jsonl --train train.json
+评估：python evaluation.py metrics --preds preds_*.jsonl [--intersect]   # 然后 python evaluation.py judge --eval eval_*.jsonl --judge_models <模型>
 """
 
 import argparse
@@ -61,109 +61,10 @@ from prompts import (
 
 
 # ----------------------------------------------------------------------------
-# 2. NILE 解析 / 系统验证 / 规范化比较
+# 2. NILE 解析 / 系统验证 / 规范化比较（统一来自 utils.py 与 evaluation.py，避免两份定义不同步）
 # ----------------------------------------------------------------------------
-SCOPE = (
-    r"(?:for\s+(?:endpoint|group|service|traffic)\('[^']*'\)"
-    r"|from\s+endpoint\('[^']*'\)\s+to\s+endpoint\('[^']*'\))"
-)
-ITEM = r"[a-z]+\('[^']*'(?:\s*,\s*'[^']*')*\)"
-TIME = r"start\s+(?P<tk>hour|date)\('[^']*'\)\s+end\s+(?P=tk)\('[^']*'\)"
-NILE_RE = re.compile(
-    rf"^define intent uniIntent:\s*(?P<scope>{SCOPE})\s+(?P<action>allow|block|set|unset|add|remove)\s+"
-    rf"(?P<body>.+?)(?:\s+(?P<time>{TIME}))?\s*$"
-)
-ALLOWED = {
-    "allow": {"service", "traffic", "protocol"},
-    "block": {"service", "traffic", "protocol"},
-    "set": {"bandwidth", "quota"},
-    "unset": {"bandwidth", "quota"},
-    "add": {"middlebox"},
-    "remove": {"middlebox"},
-}
-BW_UNITS = {"bps", "kbps", "mbps", "gbps"}
-Q_UNITS = {"mb/d", "gb/d", "mb/wk", "gb/wk", "mb/mth", "gb/mth"}
-
-
-def _nc(t):
-    return re.sub(r"\s*,\s*", ",", t.strip())
-
-
-def parse_nile(s):
-    """返回 (dict, None) 或 (None, 错误信息)。同时承担"系统验证"的语法检查。"""
-    m = NILE_RE.match(s.strip())
-    if not m:
-        return (
-            None,
-            "does not match the NILE template (scope / action / items / optional time window)",
-        )
-    action, body = m.group("action"), m.group("body")
-    items = re.findall(ITEM, body)
-    if not items or _nc(body) != _nc(", ".join(items)):
-        return None, "items must be a comma-separated list of name('arg') entries"
-    for it in items:
-        name, args = it.split("(")[0], re.findall(r"'([^']*)'", it)
-        if name not in ALLOWED[action]:
-            return None, f"item '{name}' is not allowed after '{action}'"
-        if name == "bandwidth":
-            if not (
-                len(args) == 3
-                and args[0] in ("max", "min")
-                and args[1].isdigit()
-                and args[2] in BW_UNITS
-            ):
-                return (
-                    None,
-                    "bandwidth must be bandwidth('max'|'min','<number>','<bps|kbps|mbps|gbps>')",
-                )
-        elif name == "quota":
-            if not (
-                len(args) == 3
-                and args[0] in ("download", "upload")
-                and args[1].isdigit()
-                and args[2] in Q_UNITS
-            ):
-                return (
-                    None,
-                    "quota must be quota('download'|'upload','<number>','<mb/d|gb/d|mb/wk|gb/wk|mb/mth|gb/mth>')",
-                )
-        elif len(args) != 1:
-            return None, f"{name}(...) takes exactly one argument"
-    return {
-        "scope": m.group("scope"),
-        "action": action,
-        "items": items,
-        "time": m.group("time") or "",
-    }, None
-
-
-def canon(s):
-    """规范形式 (scope, action, items, time)：
-    - 数值去前导零（'0299' == '299'）；items 顺序无关
-    - unset 的数值在自然语言里无法恢复，故忽略 unset 的数值/单位（quota 只保留周期 d/wk/mth）"""
-    p, _ = parse_nile(s)
-    if p is None:
-        return None
-    items = []
-    for it in p["items"]:
-        name, args = it.split("(")[0], re.findall(r"'([^']*)'", it)
-        if name in ("bandwidth", "quota"):
-            num, unit = str(int(args[1])), args[2]
-            if p["action"] == "unset":
-                num = "*"
-                unit = "*" if name == "bandwidth" else "*/" + unit.split("/")[-1]
-            args = [args[0], num, unit]
-        items.append(name + "(" + ",".join(args) + ")")
-    return (
-        re.sub(r"\s+", " ", p["scope"]),
-        p["action"],
-        tuple(sorted(items)),
-        re.sub(r"\s+", " ", p["time"]),
-    )
-
-
-def norm_ws(s):
-    return re.sub(r"\s+", " ", s.strip())
+from utils import parse_nile, norm_ws  # noqa: E402,F401  语法检查
+from evaluation import canon, compile_nile_rules  # noqa: E402,F401  L2 规范形式 / L3 规则集合
 
 
 # ----------------------------------------------------------------------------
@@ -216,7 +117,7 @@ def llm_chat(model, messages, num_ctx=4096, seed=42, stats=None):
     result = r.json()
     if (
         stats is not None
-    ):  # 记录 token 数（few-shot 提示长、微调模型提示短，可用于成本对比）
+    ):  # 记录 token 数；注意 prompt_eval_count 不含被 KV cache 复用的前缀，仅供参考
         stats["prompt_tokens"] = result.get("prompt_eval_count")
         stats["gen_tokens"] = result.get("eval_count")
     if VERBOSE:
@@ -397,9 +298,12 @@ def model_info(model):
 
 
 def _gold_ok(pred, gold):
-    """仅供 icl_cl 决定"这条是否加入示例库"（模拟用户校验）。其余指标都在 nile_eval.py 里算。"""
-    c = canon(pred)
-    return c is not None and c == canon(gold)
+    """仅供 icl_cl 决定"这条是否加入示例库"（模拟用户校验）。
+    判据 = evaluation.py 里 L3 的 equiv（规则集合完全相等：含单位换算/大小写/时间补零），
+    这样"哪些样本被当作错误并学习"与最终报告的主指标口径一致。"""
+    pr, _, _ = compile_nile_rules(pred)
+    gr, _, _ = compile_nile_rules(gold)
+    return pr is not None and gr is not None and pr == gr
 
 
 def cmd_predict(a):
@@ -461,12 +365,16 @@ def cmd_predict(a):
         pred, _, _ = translate(
             a.model, it["natural_language"], ex, a.max_retry, a.num_ctx, a.seed, stats
         )
+        # prompt_tokens 来自 ollama 的 prompt_eval_count，命中 KV cache 的前缀不计入，会低估（base 尤其明显）；
+        # prompt_chars 是不受缓存影响的提示长度，做"提示长度/成本"对比请用它（或另用 tokenizer 数）
+        prompt_chars = len(build_system(ex)) + len(user_msg(it["natural_language"]))
         return {
             "id": it["id"],
             "nl": it["natural_language"],
             "gold": it["nile"],
             "pred": pred,
             "sec": round(time.time() - t0, 2),
+            "prompt_chars": prompt_chars,
             "prompt_tokens": stats.get("prompt_tokens"),
             "gen_tokens": stats.get("gen_tokens"),
         }
@@ -543,7 +451,7 @@ def cmd_predict(a):
     print(
         f"\n完成 {meta['n_done']}/{len(data)} 条 -> {out_path}；运行信息 -> {meta_path}"
     )
-    print(f"下一步：python nile_eval.py metrics --preds {out_path} --train {a.train}")
+    print(f"下一步：python evaluation.py metrics --preds {out_path}")
     if failed:
         print(
             f"有 {len(failed)} 条失败（见上面 [FAIL]）。重新运行同一条命令即可只补跑这些样本。"
@@ -552,10 +460,27 @@ def cmd_predict(a):
 
 
 # ----------------------------------------------------------------------------
-# 7. 子命令：finetune（LoRA，unsloth，4bit，lr 2e-4，3 epochs —— 与论文设置一致）
+# 7. 子命令：finetune —— 对齐原论文 finetuning.py
+#    保持一致：unsloth / 4bit / LoRA r=16 alpha=16 / lr 2e-4 / 3 epochs / 有效 batch 8 / adamw_8bit /
+#              linear 调度 / warmup 5 / packing=False / 整段文本算 loss / 导出 q4_k_m GGUF
+#    相对论文的改动：
+#      ① 训练文本里的 SYSTEM 用本项目的 SYSTEM_BASE，用户输入用 user_msg（与推理完全一致）
+#      ② 手动拼文本并显式加 EOS，不依赖 unsloth.apply_chat_template 的内部行为
+#      ③ 不用 to_sharegpt(conversation_extension=3)：它会把 3 条无关样本拼成一段多轮对话，而推理是单轮
+#      ④ A100：bf16 自动启用；batch 8 x accum 1（有效 batch 与论文 2 x 4 相同，但更快）
 # ----------------------------------------------------------------------------
-def llama31_text(system, user, assistant):
-    """与 ollama 的 llama3.1 模板一致（BOS 由 tokenizer 自动添加）。"""
+FT_STYLES = {
+    # paper ：论文做法 —— 基座模型(非 Instruct) + 自定义 "{SYSTEM}\nUSER: {INPUT}\nASSISTANT: {OUTPUT}" 模板
+    "paper": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+    # llama3：Instruct 模型 + 官方 llama3 对话模板（与 ollama 的 llama3.1:8b 同一族，做对照用）
+    "llama3": "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
+}
+
+
+def ft_text(style, system, user, assistant, eos):
+    """一条训练文本。BOS 由 tokenizer 自动添加。"""
+    if style == "paper":
+        return f"{system}\nUSER: {user}\nASSISTANT: {assistant}{eos}"
     return (
         f"<|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>"
         f"<|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>"
@@ -563,7 +488,19 @@ def llama31_text(system, user, assistant):
     )
 
 
-MODELFILE = '''FROM {gguf}
+# Ollama 的 TEMPLATE 必须与训练文本逐字符一致。
+# paper 风格：提示在 "ASSISTANT:" 处结束（不带空格），模型生成的第一个 token 是 " define"，
+# 与训练时 "ASSISTANT: define" 的分词一致；clean_output 会截取 "define intent" 之后的内容。
+MODELFILE_PAPER = '''FROM {gguf}
+TEMPLATE """{{{{ if .System }}}}{{{{ .System }}}}
+{{{{ end }}}}USER: {{{{ .Prompt }}}}
+ASSISTANT:{{{{ .Response }}}}"""
+PARAMETER stop "<|end_of_text|>"
+PARAMETER stop "USER:"
+PARAMETER temperature 0
+'''
+
+MODELFILE_LLAMA3 = '''FROM {gguf}
 TEMPLATE """{{{{ if .System }}}}<|start_header_id|>system<|end_header_id|>
 
 {{{{ .System }}}}<|eot_id|>{{{{ end }}}}<|start_header_id|>user<|end_header_id|>
@@ -576,37 +513,56 @@ PARAMETER stop "<|start_header_id|>"
 PARAMETER stop "<|end_header_id|>"
 PARAMETER temperature 0
 '''
+MODELFILES = {"paper": MODELFILE_PAPER, "llama3": MODELFILE_LLAMA3}
 
 
 def cmd_finetune(a):
-    from unsloth import FastLanguageModel, is_bfloat16_supported
+    from unsloth import (
+        FastLanguageModel,
+        is_bfloat16_supported,
+    )  # unsloth 必须先于 transformers/trl 导入
     from datasets import Dataset
     from trl import SFTTrainer, SFTConfig
 
+    style = a.ft_style
+    hf_model = a.hf_model or FT_STYLES[style]
+    bf16 = is_bfloat16_supported()  # A100: True
     train = load(a.train)
-    ds = Dataset.from_list(
-        [
-            {
-                "text": llama31_text(
-                    SYSTEM_BASE, user_msg(it["natural_language"]), it["nile"]
-                )
-            }
-            for it in train
-        ]
+    print(
+        f"微调配置：style={style}  基座={hf_model}  训练样本={len(train)}  bf16={bf16}  "
+        f"batch={a.ft_batch}x{a.ft_accum}(有效 {a.ft_batch * a.ft_accum})  epochs={a.ft_epochs}  lr={a.ft_lr}"
     )
+
     model, tok = FastLanguageModel.from_pretrained(
-        a.hf_model,
-        max_seq_length=a.max_seq_len,
-        load_in_4bit=True,
-        dtype=None,
+        hf_model, max_seq_length=a.max_seq_len, dtype=None, load_in_4bit=True
+    )  # dtype=None：自动（A100 用 bf16）
+    eos = tok.eos_token
+    texts = [
+        ft_text(style, SYSTEM_BASE, user_msg(it["natural_language"]), it["nile"], eos)
+        for it in train
+    ]
+
+    lens = [len(tok(t)["input_ids"]) for t in texts]  # 检查有没有被 max_seq_len 截断
+    n_trunc = sum(l > a.max_seq_len for l in lens)
+    print(
+        f"训练文本 token 长度：平均 {sum(lens) / len(lens):.0f}，最大 {max(lens)}；超过 max_seq_len={a.max_seq_len} 的有 {n_trunc} 条"
     )
+    if n_trunc:
+        print("  [警告] 这些样本的结尾（含答案）会被截断，请调大 --max_seq_len")
+    print(
+        "---- 第 1 条训练文本（请核对格式）----\n"
+        + texts[0]
+        + "\n--------------------------------------"
+    )
+    ds = Dataset.from_list([{"text": t} for t in texts])
+
     model = FastLanguageModel.get_peft_model(
         model,
         r=16,
         lora_alpha=16,
         lora_dropout=0,
         bias="none",
-        random_state=a.seed,
+        random_state=a.ft_seed,
         target_modules=[
             "q_proj",
             "k_proj",
@@ -617,6 +573,8 @@ def cmd_finetune(a):
             "down_proj",
         ],
         use_gradient_checkpointing="unsloth",
+        use_rslora=False,
+        loftq_config=None,
     )
     trainer = SFTTrainer(
         model=model,
@@ -625,39 +583,80 @@ def cmd_finetune(a):
         args=SFTConfig(
             dataset_text_field="text",
             max_seq_length=a.max_seq_len,
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=4,
-            num_train_epochs=3,
-            learning_rate=2e-4,
+            dataset_num_proc=2,
+            packing=False,
+            per_device_train_batch_size=a.ft_batch,
+            gradient_accumulation_steps=a.ft_accum,
+            num_train_epochs=a.ft_epochs,
+            learning_rate=a.ft_lr,
             warmup_steps=5,
-            logging_steps=10,
-            fp16=not is_bfloat16_supported(),
-            bf16=is_bfloat16_supported(),
+            logging_steps=5,
+            fp16=not bf16,
+            bf16=bf16,
             optim="adamw_8bit",
             weight_decay=0.01,
             lr_scheduler_type="linear",
-            seed=a.seed,
+            seed=a.ft_seed,
             output_dir=a.out + "_ckpt",
             report_to="none",
         ),
     )
-    trainer.train()
+    stats = trainer.train()
+
     model.save_pretrained(a.out + "_lora")
     tok.save_pretrained(a.out + "_lora")
-    model.save_pretrained_gguf(a.out + "_gguf", tok, quantization_method="q4_k_m")
-    ggufs = glob.glob(os.path.join(a.out + "_gguf", "*.gguf"))
-    if ggufs:
-        mf = os.path.join(a.out + "_gguf", "Modelfile.demo")
-        open(mf, "w").write(MODELFILE.format(gguf=os.path.abspath(ggufs[0])))
-        print(f"\n导入 ollama:  ollama create llama31-nile-ft -f {mf}")
-        print(
-            "然后评估:     python nile_llm_demo.py predict --model llama31-nile-ft --mode base"
-        )
-        print(
-            "             python nile_llm_demo.py predict --model llama31-nile-ft --mode icl   (论文的 FT+ICL)"
-        )
-    else:
+    model.save_pretrained_gguf(a.out + "_gguf", tok, quantization_method=a.ft_quant)
+
+    # 不同 unsloth 版本的导出目录/文件名略有差异：递归查找，并优先取量化后的那个文件（避免误选 F16）
+    ggufs = sorted(glob.glob(f"{a.out}_gguf*/**/*.gguf", recursive=True))
+    if not ggufs:
         print("未找到 .gguf，请检查 unsloth 的导出目录。")
+        return
+    gguf = next(
+        (g for g in ggufs if a.ft_quant.upper() in os.path.basename(g).upper()),
+        ggufs[0],
+    )
+    out_dir = os.path.dirname(os.path.abspath(gguf))
+    mf = os.path.join(out_dir, "Modelfile.demo")
+    with open(mf, "w", encoding="utf-8") as f:
+        f.write(MODELFILES[style].format(gguf=os.path.abspath(gguf)))
+
+    meta = {
+        "style": style,
+        "hf_model": hf_model,
+        "quant": a.ft_quant,
+        "gguf": os.path.abspath(gguf),
+        "prompt_sha1": prompt_fingerprint(),
+        "train_file": a.train,
+        "n_train": len(train),
+        "max_seq_len": a.max_seq_len,
+        "n_truncated": n_trunc,
+        "mean_tokens": round(sum(lens) / len(lens), 1),
+        "lora_r": 16,
+        "epochs": a.ft_epochs,
+        "lr": a.ft_lr,
+        "per_device_batch": a.ft_batch,
+        "grad_accum": a.ft_accum,
+        "bf16": bf16,
+        "seed": a.ft_seed,
+        "train_loss": getattr(stats, "training_loss", None),
+        "train_runtime_sec": (getattr(stats, "metrics", {}) or {}).get("train_runtime"),
+        "hardware": a.hardware,
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(os.path.join(out_dir, "ft_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    print(
+        f"\n训练完成：loss={meta['train_loss']}  用时={meta['train_runtime_sec']}s  元数据 -> {out_dir}/ft_meta.json"
+    )
+    print(f"导入 ollama:  ollama create {a.ft_name} -f {mf}")
+    print(
+        f"评估(纯微调):  python nile_llm.py predict --model {a.ft_name} --mode base --limit 50"
+    )
+    print(
+        f"评估(FT+ICL):  python nile_llm.py predict --model {a.ft_name} --mode icl --shots 9 --limit 50"
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -722,21 +721,41 @@ def main():
         "--hardware", default="unspecified"
     )  # 记录在 run_*.json 里的硬件说明，如 V100S-32GB / A100-80GB / CPU
 
-    # ---- 微调设置（只对 finetune 子命令有用） ----
+    # ---- 微调设置（只对 finetune 子命令有用；默认值对齐原论文 finetuning.py） ----
+    ap.add_argument(
+        "--ft_style", choices=["paper", "llama3"], default="llama3"
+    )  # paper=论文做法(基座模型+USER/ASSISTANT 模板)；llama3=Instruct 模型+官方模板
+    ap.add_argument(
+        "--hf_model", default=None
+    )  # 微调的基座(HuggingFace 4bit)；不填则按 --ft_style 选择：paper->Meta-Llama-3.1-8B-bnb-4bit，llama3->...-Instruct-bnb-4bit
     ap.add_argument(
         "--out", default="nile_ft"
-    )  # 输出名前缀：生成 nile_ft_lora（LoRA 权重）和 nile_ft_gguf（导出模型）
+    )  # 输出名前缀：生成 nile_ft_lora（LoRA 权重）和 nile_ft_gguf*（导出模型 + Modelfile.demo + ft_meta.json）
     ap.add_argument(
-        "--hf_model", default="unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
-    )  # 微调的基座模型（HuggingFace 上的 4bit 版）
+        "--ft_name", default="llama31-nile-ft"
+    )  # 导入 ollama 时使用的模型名；两种 style 都训练时请用不同的 --out 和 --ft_name
     ap.add_argument(
         "--max_seq_len", type=int, default=2048
-    )  # 微调时单条样本最大 token 长度
+    )  # 微调时单条样本最大 token 长度（训练时会打印是否有样本被截断）
+    ap.add_argument("--ft_epochs", type=int, default=3)  # 论文 3
+    ap.add_argument("--ft_lr", type=float, default=2e-4)  # 论文 2e-4
+    ap.add_argument(
+        "--ft_batch", type=int, default=8
+    )  # 每卡 batch；A100 上 8 x accum 1 = 论文的 2 x 4（有效 batch 都是 8）
+    ap.add_argument(
+        "--ft_accum", type=int, default=1
+    )  # 梯度累积步数；显存不够就调小 --ft_batch、调大它，保持乘积为 8
+    ap.add_argument(
+        "--ft_seed", type=int, default=3407
+    )  # 论文用 3407（LoRA 初始化 + 训练），与推理用的 --seed 分开
+    ap.add_argument(
+        "--ft_quant", default="q4_k_m"
+    )  # GGUF 量化方式；与 ollama 里 llama3.1:8b 默认的 Q4_K_M 一致
 
     a = ap.parse_args()
     if a.cmd == "eval":
         print(
-            "提示：eval 已更名为 predict；本脚本不再计算指标，请用 nile_eval.py metrics"
+            "提示：eval 已更名为 predict；本脚本不再计算指标，请用 evaluation.py metrics"
         )
         a.cmd = "predict"
     {"check": cmd_check, "predict": cmd_predict, "finetune": cmd_finetune}[a.cmd](
